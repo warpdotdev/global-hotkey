@@ -28,7 +28,9 @@ features = [
 ]
 
 [target."cfg(any(target_os = \"linux\", target_os = \"dragonfly\", target_os = \"freebsd\", target_os = \"openbsd\", target_os = \"netbsd\"))".dependencies]
-x11-dl = "2.21"
+itertools = "0.12.1"
+x11-dl = { version = "2.21", default-features = false }
+x11rb = { version = "0.13.0", features = ["dl-libxcb"] }
 
 [dev-dependencies]
 winit = "0.29"
