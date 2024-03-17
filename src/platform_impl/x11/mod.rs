@@ -17,7 +17,7 @@ use x11rb::{
         Event,
     },
     reexports::x11rb_protocol::protocol::xkb,
-    xcb_ffi::XCBConnection,
+    rust_connection::RustConnection,
 };
 
 use crate::{hotkey::HotKey, GlobalHotKeyEvent};
@@ -109,7 +109,7 @@ impl Drop for GlobalHotKeyManager {
 }
 
 fn register_hotkey(
-    conn: &XCBConnection,
+    conn: &RustConnection,
     root_win: u32,
     hotkeys: &mut HotKeyStateMap,
     hotkey: HotKey,
@@ -171,7 +171,7 @@ fn register_hotkey(
 }
 
 fn unregister_hotkey(
-    conn: &XCBConnection,
+    conn: &RustConnection,
     root_win: u32,
     hotkeys: &mut HotKeyStateMap,
     hotkey: HotKey,
@@ -204,13 +204,7 @@ fn unregister_hotkey(
 fn events_processor(thread_rx: Receiver<ThreadMessage>) {
     let mut hotkeys = HotKeyStateMap::default();
 
-    if let Err(error) = x11rb::xcb_ffi::load_libxcb() {
-        #[cfg(debug_assertions)]
-        eprintln!("Failed to dynamically load libxcb: {error:#}.  Make sure the library is installed on the host system.");
-        return;
-    }
-
-    let Ok((conn, _)) = x11rb::xcb_ffi::XCBConnection::connect(None) else {
+    let Ok((conn, _)) = RustConnection::connect(None) else {
         #[cfg(debug_assertions)]
         eprintln!("Failed to open connection to X11 server!");
         return;
@@ -221,7 +215,7 @@ fn events_processor(thread_rx: Receiver<ThreadMessage>) {
         Ok(cookie) => cookie.discard_reply_and_errors(),
         Err(error) => {
             #[cfg(debug_assertions)]
-            eprintln!("Error while enabling xkb: {error:#}");
+            eprintln!("Error while initializing xkb extension: {error:#}");
             return;
         }
     }
@@ -243,7 +237,7 @@ fn events_processor(thread_rx: Receiver<ThreadMessage>) {
         }
     }
 
-    let Some(keysym_keycode_map) = get_keysym_keycode_map(&conn) else {
+    let Some(mut keysym_keycode_map) = get_keysym_keycode_map(&conn) else {
         return;
     };
 
@@ -255,7 +249,9 @@ fn events_processor(thread_rx: Receiver<ThreadMessage>) {
 
     loop {
         match conn.poll_for_event() {
-            Ok(Some(event)) => handle_event(event, &mut hotkeys),
+            Ok(Some(event)) => {
+                handle_event(&conn, event, &mut hotkeys, &mut keysym_keycode_map)
+            },
             Ok(None) => {}
             Err(error) => {
                 #[cfg(debug_assertions)]
@@ -323,10 +319,13 @@ fn events_processor(thread_rx: Receiver<ThreadMessage>) {
                 }
             }
         }
+
+        // Sleep for 50ms in between polls of X11 events and thread messages.
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
 
-fn handle_event(event: Event, hotkeys: &mut HotKeyStateMap) {
+fn handle_event(conn: &RustConnection, event: Event, hotkeys: &mut HotKeyStateMap, keysym_keycode_map: &mut HashMap<u32, KeyCode>) {
     match event {
         Event::KeyPress(xproto::KeyPressEvent {
             detail: keycode,
@@ -369,11 +368,18 @@ fn handle_event(event: Event, hotkeys: &mut HotKeyStateMap) {
                 }
             }
         }
+        Event::MappingNotify(_) => {
+            // If the keyboard mapping has changed, recompute it.
+            let Some(new_map) = get_keysym_keycode_map(&conn) else {
+                return;
+            };
+            *keysym_keycode_map = new_map;
+        }
         _ => {}
     }
 }
 
-fn get_keysym_keycode_map(conn: &XCBConnection) -> Option<HashMap<u32, KeyCode>> {
+fn get_keysym_keycode_map(conn: &RustConnection) -> Option<HashMap<u32, KeyCode>> {
     let setup = conn.setup();
     let mapping = match conn
         .get_keyboard_mapping(setup.min_keycode, setup.max_keycode - setup.min_keycode + 1)
