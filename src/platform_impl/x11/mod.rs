@@ -12,9 +12,11 @@ use x11rb::{
     connection::Connection,
     protocol::{
         xinput::KeyCode,
-        xproto::{self, ConnectionExt, GrabMode, KeyButMask, ModMask},
+        xkb::ConnectionExt as _,
+        xproto::{self, ConnectionExt as _, GrabMode, ModMask},
         Event,
     },
+    reexports::x11rb_protocol::protocol::xkb,
     xcb_ffi::XCBConnection,
 };
 
@@ -26,6 +28,14 @@ enum ThreadMessage {
     UnRegisterHotKey(HotKey, Sender<crate::Result<()>>),
     UnRegisterHotKeys(Vec<HotKey>, Sender<crate::Result<()>>),
     DropThread,
+}
+
+type HotKeyStateMap = BTreeMap<KeyCode, Vec<HotKeyState>>;
+
+struct HotKeyState {
+    id: u32,
+    modifiers: ModMask,
+    pressed: bool,
 }
 
 pub struct GlobalHotKeyManager {
@@ -98,15 +108,15 @@ impl Drop for GlobalHotKeyManager {
     }
 }
 
-fn register_hotkey_xcb(
+fn register_hotkey(
     conn: &XCBConnection,
     root_win: u32,
-    hotkeys: &mut BTreeMap<u8, Vec<(u32, ModMask, bool)>>,
+    hotkeys: &mut HotKeyStateMap,
     hotkey: HotKey,
-    keysym_keycode_map: &HashMap<u32, u8>,
+    keysym_keycode_map: &HashMap<u32, KeyCode>,
 ) -> crate::Result<()> {
     let modifiers = hotkey.to_xcb_modifiers();
-    let Some(key) = hotkey.to_x11_keycode(keysym_keycode_map) else {
+    let Some(keycode) = hotkey.to_x11_keycode(keysym_keycode_map) else {
         return Err(crate::Error::FailedToUnRegister(hotkey));
     };
 
@@ -114,7 +124,16 @@ fn register_hotkey_xcb(
     // from requests that produced a response.
     let results = modifiers
         .into_iter()
-        .map(|m| conn.grab_key(false, root_win, m, key, GrabMode::ASYNC, GrabMode::ASYNC))
+        .map(|m| {
+            conn.grab_key(
+                false,
+                root_win,
+                m,
+                keycode,
+                GrabMode::ASYNC,
+                GrabMode::ASYNC,
+            )
+        })
         .map_ok(|cookie| cookie.check())
         .collect_vec();
 
@@ -132,56 +151,58 @@ fn register_hotkey_xcb(
     // If we failed to grab any of the key+modifier combinations, ungrab all
     // of them and return an error.
     if results.into_iter().any(|result| result.is_err()) {
-        let _ = unregister_hotkey_xcb(conn, root_win, hotkeys, hotkey, keysym_keycode_map);
+        let _ = unregister_hotkey(conn, root_win, hotkeys, hotkey, keysym_keycode_map);
         return Err(crate::Error::AlreadyRegistered(hotkey));
     }
 
-    // Update the hotkey registry.
-    let keycode = KeyCode::from(key);
     let entry = hotkeys.entry(keycode).or_default();
     let modmask = hotkey.to_xcb_modmask();
-    match entry.iter().find(|e| e.1 == modmask) {
+    match entry.iter().find(|e| e.modifiers == modmask) {
         None => {
-            entry.push((hotkey.id(), modmask, false));
+            entry.push(HotKeyState {
+                id: hotkey.id(),
+                modifiers: modmask,
+                pressed: false,
+            });
             Ok(())
         }
         Some(_) => Err(crate::Error::AlreadyRegistered(hotkey)),
     }
 }
 
-fn unregister_hotkey_xcb(
+fn unregister_hotkey(
     conn: &XCBConnection,
     root_win: u32,
-    hotkeys: &mut BTreeMap<u8, Vec<(u32, ModMask, bool)>>,
+    hotkeys: &mut HotKeyStateMap,
     hotkey: HotKey,
-    keysym_keycode_map: &HashMap<u32, u8>,
+    keysym_keycode_map: &HashMap<u32, KeyCode>,
 ) -> crate::Result<()> {
     let modifiers = hotkey.to_xcb_modifiers();
-    let Some(key) = hotkey.to_x11_keycode(keysym_keycode_map) else {
+    let Some(keycode) = hotkey.to_x11_keycode(keysym_keycode_map) else {
         return Err(crate::Error::FailedToUnRegister(hotkey));
     };
 
-    modifiers
+    // Issue all UngrabKey requests before waiting for responses.
+    let cookies = modifiers
         .into_iter()
-        .map(|m| conn.ungrab_key(key, root_win, m))
-        // Issue all UngrabKey requests before waiting for responses.
-        .collect_vec()
+        .map(|m| conn.ungrab_key(keycode, root_win, m))
+        .collect_vec();
+
+    // Consume errors for all requests that produced a response.
+    cookies
         .into_iter()
         .filter_map(|result| result.ok())
-        // Consume errors for all requests that produced a response.
         .for_each(|cookie| cookie.ignore_error());
 
-    let keycode = KeyCode::from(key);
-    let entry = hotkeys.entry(keycode).or_default();
+    let entry = hotkeys.entry(keycode as KeyCode).or_default();
     let modmask = hotkey.to_xcb_modmask();
-    entry.retain(|k| k.1 != modmask);
+    entry.retain(|k| k.modifiers != modmask);
 
     Ok(())
 }
 
 fn events_processor(thread_rx: Receiver<ThreadMessage>) {
-    //                           key    id,  mods, pressed
-    let mut hotkeys = BTreeMap::<u8, Vec<(u32, ModMask, bool)>>::new();
+    let mut hotkeys = HotKeyStateMap::default();
 
     if let Err(error) = x11rb::xcb_ffi::load_libxcb() {
         #[cfg(debug_assertions)]
@@ -194,6 +215,33 @@ fn events_processor(thread_rx: Receiver<ThreadMessage>) {
         eprintln!("Failed to open connection to X11 server!");
         return;
     };
+
+    // Enable use of xkb extensions (needed to enable detectable key repeat).
+    match conn.xkb_use_extension(1, 0) {
+        Ok(cookie) => cookie.discard_reply_and_errors(),
+        Err(error) => {
+            #[cfg(debug_assertions)]
+            eprintln!("Error while enabling xkb: {error:#}");
+            return;
+        }
+    }
+
+    // Enable detectable key repeat.
+    match conn.xkb_per_client_flags(
+        xkb::ID::USE_CORE_KBD.into(),
+        xkb::PerClientFlag::DETECTABLE_AUTO_REPEAT,
+        xkb::PerClientFlag::DETECTABLE_AUTO_REPEAT,
+        xkb::BoolCtrl::default(),
+        xkb::BoolCtrl::default(),
+        xkb::BoolCtrl::default(),
+    ) {
+        Ok(cookie) => cookie.discard_reply_and_errors(),
+        Err(error) => {
+            #[cfg(debug_assertions)]
+            eprintln!("Error while enabling detectable key repeat: {error:#}");
+            return;
+        }
+    }
 
     let Some(keysym_keycode_map) = get_keysym_keycode_map(&conn) else {
         return;
@@ -219,7 +267,7 @@ fn events_processor(thread_rx: Receiver<ThreadMessage>) {
         if let Ok(msg) = thread_rx.try_recv() {
             match msg {
                 ThreadMessage::RegisterHotKey(hotkey, tx) => {
-                    let _ = tx.send(register_hotkey_xcb(
+                    let _ = tx.send(register_hotkey(
                         &conn,
                         root_win,
                         &mut hotkeys,
@@ -228,23 +276,24 @@ fn events_processor(thread_rx: Receiver<ThreadMessage>) {
                     ));
                 }
                 ThreadMessage::RegisterHotKeys(keys, tx) => {
-                    if let Err(err) = keys.into_iter().try_for_each(|hotkey| {
-                        register_hotkey_xcb(
-                            &conn,
-                            root_win,
-                            &mut hotkeys,
-                            hotkey,
-                            &keysym_keycode_map,
-                        )
-                    }) {
-                        // Send the first error, if any, as the response.
-                        let _ = tx.send(Err(err));
-                    } else {
-                        let _ = tx.send(Ok(()));
-                    }
+                    // Try registering all provided hotkeys, returning the first error encountered
+                    // (if any).
+                    let _ = tx.send(
+                        keys.into_iter()
+                            .try_for_each(|hotkey| {
+                                register_hotkey(
+                                    &conn,
+                                    root_win,
+                                    &mut hotkeys,
+                                    hotkey,
+                                    &keysym_keycode_map,
+                                )
+                            })
+                            .map(|_| ()),
+                    );
                 }
                 ThreadMessage::UnRegisterHotKey(hotkey, tx) => {
-                    let _ = tx.send(unregister_hotkey_xcb(
+                    let _ = tx.send(unregister_hotkey(
                         &conn,
                         root_win,
                         &mut hotkeys,
@@ -253,20 +302,21 @@ fn events_processor(thread_rx: Receiver<ThreadMessage>) {
                     ));
                 }
                 ThreadMessage::UnRegisterHotKeys(keys, tx) => {
-                    if let Err(err) = keys.into_iter().try_for_each(|hotkey| {
-                        unregister_hotkey_xcb(
-                            &conn,
-                            root_win,
-                            &mut hotkeys,
-                            hotkey,
-                            &keysym_keycode_map,
-                        )
-                    }) {
-                        // Send the first error, if any, as the response.
-                        let _ = tx.send(Err(err));
-                    } else {
-                        let _ = tx.send(Ok(()));
-                    }
+                    // Try unregistering all provided hotkeys, returning the first error encountered
+                    // (if any).
+                    let _ = tx.send(
+                        keys.into_iter()
+                            .try_for_each(|hotkey| {
+                                unregister_hotkey(
+                                    &conn,
+                                    root_win,
+                                    &mut hotkeys,
+                                    hotkey,
+                                    &keysym_keycode_map,
+                                )
+                            })
+                            .map(|_| ()),
+                    );
                 }
                 ThreadMessage::DropThread => {
                     break;
@@ -276,48 +326,46 @@ fn events_processor(thread_rx: Receiver<ThreadMessage>) {
     }
 }
 
-fn handle_event(event: Event, hotkeys: &mut BTreeMap<u8, Vec<(u32, ModMask, bool)>>) {
+fn handle_event(event: Event, hotkeys: &mut HotKeyStateMap) {
     match event {
         Event::KeyPress(xproto::KeyPressEvent {
             detail: keycode,
             state,
-            response_type,
-            ..
-        })
-        | Event::KeyRelease(xproto::KeyReleaseEvent {
-            detail: keycode,
-            state,
-            response_type,
             ..
         }) => {
-            let event_mods = keybutmask_to_modmask(state)
+            let event_mods = ModMask::from(state.bits())
                 & (ModMask::CONTROL | ModMask::SHIFT | ModMask::M1 | ModMask::M4);
-
-            if let Some(entry) = hotkeys.get_mut(&keycode) {
-                match response_type {
-                    xproto::KEY_PRESS_EVENT => {
-                        for (id, mods, pressed) in entry {
-                            if event_mods == *mods && !*pressed {
-                                GlobalHotKeyEvent::send(GlobalHotKeyEvent {
-                                    id: *id,
-                                    state: crate::HotKeyState::Pressed,
-                                });
-                                *pressed = true;
-                            }
-                        }
-                    }
-                    xproto::KEY_RELEASE_EVENT => {
-                        for (id, _, pressed) in entry {
-                            if *pressed {
-                                GlobalHotKeyEvent::send(GlobalHotKeyEvent {
-                                    id: *id,
-                                    state: crate::HotKeyState::Released,
-                                });
-                                *pressed = false;
-                            }
-                        }
-                    }
-                    _ => {}
+            let Some(entry) = hotkeys.get_mut(&keycode) else {
+                return;
+            };
+            for HotKeyState {
+                id,
+                modifiers,
+                pressed,
+            } in entry
+            {
+                if event_mods == *modifiers && !*pressed {
+                    GlobalHotKeyEvent::send(GlobalHotKeyEvent {
+                        id: *id,
+                        state: crate::HotKeyState::Pressed,
+                    });
+                    *pressed = true;
+                }
+            }
+        }
+        Event::KeyRelease(xproto::KeyReleaseEvent {
+            detail: keycode, ..
+        }) => {
+            let Some(entry) = hotkeys.get_mut(&keycode) else {
+                return;
+            };
+            for HotKeyState { id, pressed, .. } in entry {
+                if *pressed {
+                    GlobalHotKeyEvent::send(GlobalHotKeyEvent {
+                        id: *id,
+                        state: crate::HotKeyState::Released,
+                    });
+                    *pressed = false;
                 }
             }
         }
@@ -325,12 +373,10 @@ fn handle_event(event: Event, hotkeys: &mut BTreeMap<u8, Vec<(u32, ModMask, bool
     }
 }
 
-fn get_keysym_keycode_map(conn: &XCBConnection) -> Option<HashMap<u32, u8>> {
-    const MIN_KEYCODE: u8 = 8;
-    const MAX_KEYCODE: u8 = 255;
-
+fn get_keysym_keycode_map(conn: &XCBConnection) -> Option<HashMap<u32, KeyCode>> {
+    let setup = conn.setup();
     let mapping = match conn
-        .get_keyboard_mapping(MIN_KEYCODE, MAX_KEYCODE - MIN_KEYCODE + 1)
+        .get_keyboard_mapping(setup.min_keycode, setup.max_keycode - setup.min_keycode + 1)
         .map(|cookie| cookie.reply())
     {
         Ok(Ok(mapping)) => mapping,
@@ -346,15 +392,18 @@ fn get_keysym_keycode_map(conn: &XCBConnection) -> Option<HashMap<u32, u8>> {
         }
     };
 
-    let mut keysym_keycode_map = HashMap::<u32, u8>::default();
+    let mut keysym_keycode_map = HashMap::<u32, KeyCode>::default();
     for (keycode, keysyms) in mapping
         .keysyms
         .chunks(mapping.keysyms_per_keycode as usize)
         .enumerate()
     {
+        // Add min_keycode to the chunk index to get the actual keycode.
+        let keycode = keycode as u8 + setup.min_keycode;
+
         for keysym in keysyms {
             if *keysym != x11rb::NO_SYMBOL {
-                keysym_keycode_map.insert(*keysym, keycode as u8 + MIN_KEYCODE);
+                keysym_keycode_map.insert(*keysym, keycode);
             }
         }
     }
@@ -393,7 +442,7 @@ impl HotKey {
         mask
     }
 
-    fn to_x11_keycode(&self, keysym_keycode_map: &HashMap<u32, u8>) -> Option<u8> {
+    fn to_x11_keycode(&self, keysym_keycode_map: &HashMap<u32, KeyCode>) -> Option<KeyCode> {
         let keysym = keycode_to_x11_scancode(self.key);
         keysym.and_then(|k| keysym_keycode_map.get(&k)).cloned()
     }
@@ -500,8 +549,4 @@ fn keycode_to_x11_scancode(key: Code) -> Option<u32> {
 
         _ => return None,
     })
-}
-
-fn keybutmask_to_modmask(mask: KeyButMask) -> ModMask {
-    mask.bits().into()
 }
