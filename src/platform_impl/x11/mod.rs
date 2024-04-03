@@ -117,7 +117,10 @@ fn register_hotkey(
 ) -> crate::Result<()> {
     let modifiers = hotkey.to_xcb_modifiers();
     let Some(keycode) = hotkey.to_x11_keycode(keysym_keycode_map) else {
-        return Err(crate::Error::FailedToUnRegister(hotkey));
+        return Err(crate::Error::FailedToRegister(format!(
+            "Could not determine X11 keycode for hotkey \"{}\"",
+            hotkey.key
+        )));
     };
 
     // Attempt to grab all key + modifier combinations, consuming any errors
@@ -249,9 +252,7 @@ fn events_processor(thread_rx: Receiver<ThreadMessage>) {
 
     loop {
         match conn.poll_for_event() {
-            Ok(Some(event)) => {
-                handle_event(&conn, event, &mut hotkeys, &mut keysym_keycode_map)
-            },
+            Ok(Some(event)) => handle_event(&conn, event, &mut hotkeys, &mut keysym_keycode_map),
             Ok(None) => {}
             Err(error) => {
                 #[cfg(debug_assertions)]
@@ -325,7 +326,12 @@ fn events_processor(thread_rx: Receiver<ThreadMessage>) {
     }
 }
 
-fn handle_event(conn: &RustConnection, event: Event, hotkeys: &mut HotKeyStateMap, keysym_keycode_map: &mut HashMap<u32, KeyCode>) {
+fn handle_event(
+    conn: &RustConnection,
+    event: Event,
+    hotkeys: &mut HotKeyStateMap,
+    keysym_keycode_map: &mut HashMap<u32, KeyCode>,
+) {
     match event {
         Event::KeyPress(xproto::KeyPressEvent {
             detail: keycode,
