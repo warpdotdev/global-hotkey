@@ -9,6 +9,10 @@ on:
     branches:
       - dev
 
+permissions:
+  contents: write # covector pushes tags and creates GitHub releases; create-pull-request pushes the release branch
+  pull-requests: write # create-pull-request opens and labels the version-bump PR
+
 jobs:
   version-or-publish:
     runs-on: ubuntu-latest
